@@ -12,7 +12,37 @@ import "strconv"
 //
 // example to show how to declare the arguments
 // and reply for an RPC.
-//
+
+type TaskType int
+
+const (
+	MapPhase TaskType = iota
+	ReducePhase
+	StopPhase
+	Done
+)
+
+type GetTaskArgs struct {
+}
+
+type FinishMapTaskArgs struct {
+	TaskId int
+}
+
+type FinishReduceTaskArgs struct {
+	TaskId int
+}
+
+type TaskFinishedReply struct {
+}
+
+type GetTaskReply struct {
+	FileName      string
+	MapTaskId     int
+	ReduceTaskId  int
+	CntReduceTask int
+	TaskType      TaskType
+}
 
 type ExampleArgs struct {
 	X int
@@ -23,7 +53,6 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
-
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
