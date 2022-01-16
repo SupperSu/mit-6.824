@@ -11,15 +11,6 @@ import "os"
 import "net/rpc"
 import "net/http"
 
-type TaskStatus int
-
-const (
-	Working TaskStatus = iota
-	Unsigned
-	Success
-	Failed
-)
-
 type Coordinator struct {
 	// Your definitions here.
 	succeededTask int
@@ -27,7 +18,9 @@ type Coordinator struct {
 	reduceTaskId  int
 	nReduce       int
 	tasksMap      TasksMap
-	tasksToDo     chan Task
+	taskToDo      chan *Task
+	taskFailed    chan *Task
+	taskSucceeded chan *Task
 	mu            sync.Mutex
 	files         []string
 	taskPhase     TaskType
@@ -40,9 +33,9 @@ type TasksMap struct {
 
 type Task struct {
 	taskId      int
+	fileName    string // for mapping task
 	taskPhase   TaskType
 	monitorChan chan bool
-	taskStatus  TaskStatus
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -60,12 +53,11 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 // go routine to monitor task table
 
 func (c *Coordinator) MonitorTask(pTask *Task) {
+	fmt.Printf("Monitor task %d \n", pTask.taskId)
 	select {
 	case success := <-pTask.monitorChan:
-		if success && pTask.taskPhase == MapPhase {
-			goto mapTaskSuccess
-		} else if success && pTask.taskPhase == ReducePhase {
-			goto reduceTaskSuccess
+		if success {
+			goto taskSuccess
 		} else {
 			goto taskFailure
 		}
@@ -73,105 +65,74 @@ func (c *Coordinator) MonitorTask(pTask *Task) {
 		goto taskFailure
 	}
 
-mapTaskSuccess:
-	c.mu.Lock()
-	pTask.taskStatus = Success
-	c.succeededTask++
-	fmt.Printf("monitor task in map succees %d \n", pTask.taskId)
-	fmt.Printf("files number are %d \n", len(c.files))
-
-	if c.succeededTask == len(c.files) {
-		// switch to reduce phase
-		c.taskPhase = ReducePhase
-		c.succeededTask = 0
-		c.tasksMap.tasksMap = make(map[int]*Task)
-	}
-	c.mu.Unlock()
-	return
-
-reduceTaskSuccess:
-	c.mu.Lock()
-	pTask.taskStatus = Success
-	c.succeededTask++
-	fmt.Printf("monitor task in reduce succees %d \n", pTask.taskId)
-
-	if c.succeededTask == c.nReduce {
-		// switch to reduce phase
-		c.taskPhase = Done
-	}
-	c.mu.Unlock()
+taskSuccess:
+	c.taskSucceeded <- pTask
+	fmt.Printf("monitor task success %d \n", pTask.taskId)
 	return
 
 taskFailure:
-	c.mu.Lock()
-	pTask.taskStatus = Unsigned
+	c.taskFailed <- pTask
 	fmt.Printf("monitor task failed %d \n", pTask.taskId)
-	c.mu.Unlock()
 	return
 }
 
-func (c *Coordinator) retrieveUnsignedTask() *Task {
-	select {
-	case task, ok := <-c.tasksToDo:
-		if ok {
+func (c *Coordinator) taskManager() {
+	for {
+		if c.taskPhase == Done {
+			break
+		}
+		fmt.Printf("Task Manager running \n")
+		select {
+		case t1 := <-c.taskFailed:
+			fmt.Printf("Pushed Failed task into todo queue \n")
+			c.taskToDo <- t1
+			break
+		case <-c.taskSucceeded:
+			c.succeededTask++
+			c.mu.Lock()
+			fmt.Printf("Success task %d pushed \n", c.succeededTask)
+			if c.succeededTask == len(c.files) && c.taskPhase == MapPhase {
+				c.taskPhase = ReducePhase
+				c.succeededTask = 0
+				c.tasksMap.tasksMap = make(map[int]*Task)
 
+				for i := 0; i < c.nReduce; i++ {
+					task := &Task{taskId: i, taskPhase: ReducePhase, monitorChan: make(chan bool, 1)}
+					c.taskToDo <- task
+					fmt.Printf("reduce task %d pushed \n", i)
+				}
+			} else if c.succeededTask == c.nReduce && c.taskPhase == ReducePhase {
+				c.taskPhase = Done
+			}
+			c.mu.Unlock()
+			break
 		}
 	}
-	return nil
 }
 
 func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
-	switch c.taskPhase {
-	case MapPhase:
-		pTask := c.retrieveUnsignedTask()
-		if pTask == nil {
-			reply.MapTaskId = c.mapTaskId
-			pTask = &Task{taskId: c.mapTaskId, taskPhase: MapPhase, monitorChan: make(chan bool), taskStatus: Working}
-			c.tasksMap.tasksMap[pTask.taskId] = pTask
-			c.mu.Lock()
-			c.mapTaskId++
-			c.mu.Unlock()
-		}
-		reply.FileName = c.files[pTask.taskId]
+	select {
+	case task := <-c.taskToDo:
+		c.tasksMap.rwmu.Lock()
+		c.tasksMap.tasksMap[task.taskId] = task
+		c.tasksMap.rwmu.Unlock()
+		reply.TaskType = task.taskPhase
+		reply.TaskId = task.taskId
 		reply.CntReduceTask = c.nReduce
-		reply.TaskType = pTask.taskPhase
-		go c.MonitorTask(pTask)
-		fmt.Printf("monitor task in map phase %d \n", pTask.taskId)
-
-		break
-	case ReducePhase:
-		pTask := c.retrieveUnsignedTask()
-		if pTask == nil {
-			reply.ReduceTaskId = c.reduceTaskId
-			pTask = &Task{taskId: c.reduceTaskId, taskPhase: ReducePhase, monitorChan: make(chan bool), taskStatus: Working}
-			c.tasksMap.tasksMap[pTask.taskId] = pTask
-			c.mu.Lock()
-			c.reduceTaskId++
-			c.mu.Unlock()
-		}
-		reply.ReduceTaskId = pTask.taskId
-		reply.TaskType = ReducePhase
-		go c.MonitorTask(pTask)
-		fmt.Printf("monitor task in reduce phase %d", pTask.taskId)
-		break
-	case StopPhase:
-		reply.TaskType = StopPhase
-		break
-	default:
-		// stop phase don't need to assign any additional variables
-
-		break
+		reply.FileName = task.fileName
+		fmt.Printf("Sent out task with id %d, phase %s \n", task.taskId, task.taskPhase)
+		go c.MonitorTask(task)
+	case <-time.After(12 * time.Second):
+		fmt.Printf("Timeout for pulling out a new task")
+		reply.TaskType = Relax
 	}
 	return nil
 }
 
-func (c *Coordinator) MarkMapTaskFinish(args *FinishMapTaskArgs, reply *TaskFinishedReply) error {
+func (c *Coordinator) MarkTaskFinish(args *FinishTaskArgs, reply *TaskFinishedReply) error {
+	c.tasksMap.rwmu.RLock()
 	c.tasksMap.tasksMap[args.TaskId].monitorChan <- true
-	return nil
-}
-
-func (c *Coordinator) MarkReduceTaskFinish(args *FinishReduceTaskArgs, reply *TaskFinishedReply) error {
-	c.tasksMap.tasksMap[args.TaskId].monitorChan <- true
+	c.tasksMap.rwmu.RUnlock()
 	return nil
 }
 
@@ -217,7 +178,18 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.nReduce = nReduce
 	c.files = files
 	c.tasksMap.tasksMap = make(map[int]*Task)
+	c.taskToDo = make(chan *Task, len(files)+nReduce)
+	c.taskSucceeded = make(chan *Task, len(files)+nReduce)
+	c.taskFailed = make(chan *Task, len(files)+nReduce)
+	// initialize mapping tasks and push to toTo channel
+	go c.taskManager()
+	go func() {
+		for id, fil := range files {
+			task := &Task{taskId: id, fileName: fil, taskPhase: MapPhase, monitorChan: make(chan bool, 1)}
+			c.taskToDo <- task
+		}
+	}()
+
 	c.server()
-	// initial phase is mapping phase
 	return &c
 }

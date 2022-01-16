@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -61,7 +62,11 @@ func Worker(mapf func(string, string) []KeyValue,
 	// CallExample()
 
 	for {
-		reply := getTask()
+		reply, status := getTask()
+		if status == false {
+			fmt.Printf("Exit work process \n")
+			os.Exit(1)
+		}
 		switch reply.TaskType {
 		case MapPhase:
 			filename := reply.FileName
@@ -75,16 +80,16 @@ func Worker(mapf func(string, string) []KeyValue,
 			}
 			file.Close()
 			kvas := mapf(filename, string(content))
-			writeKeyVals(kvas, reply.MapTaskId, reply.CntReduceTask)
-			call("Coordinator.MarkMapTaskFinish", &FinishMapTaskArgs{TaskId: reply.MapTaskId}, &TaskFinishedReply{})
+			writeKeyVals(kvas, reply.TaskId, reply.CntReduceTask)
+			call("Coordinator.MarkTaskFinish", &FinishTaskArgs{TaskId: reply.TaskId}, &TaskFinishedReply{})
 			time.Sleep(1 * time.Second)
 			break
 		case ReducePhase:
 			// go through intermediate files and find same reduceId files
-			matchedFiles, _ := findMatchedFiles(filepath.Join(basepath, "../main"), reply.ReduceTaskId)
+			matchedFiles, _ := findMatchedFiles(filepath.Join(basepath, "../main"), reply.TaskId)
 			kvalsMap := make(map[string][]string)
 			for _, fileName := range matchedFiles {
-				fmt.Printf("%s \n", fileName)
+				//fmt.Printf("%s \n", fileName)
 				file, err := os.Open(fileName)
 				if err != nil {
 					log.Fatalf("failed to read %s", fileName)
@@ -99,20 +104,22 @@ func Worker(mapf func(string, string) []KeyValue,
 				}
 				file.Close()
 			}
-			oname := fmt.Sprintf("mr-out-%d", reply.ReduceTaskId)
+			oname := fmt.Sprintf("mr-out-%d", reply.TaskId)
 			ofile, _ := os.Create(oname)
 			for k, vals := range kvalsMap {
 				output := reducef(k, vals)
 				fmt.Fprintf(ofile, "%v %v\n", k, output)
 			}
 			ofile.Close()
-			call("Coordinator.MarkReduceTaskFinish",
-				&FinishReduceTaskArgs{TaskId: reply.ReduceTaskId}, &TaskFinishedReply{})
+			call("Coordinator.MarkTaskFinish",
+				&FinishTaskArgs{TaskId: reply.TaskId}, &TaskFinishedReply{})
 			time.Sleep(1 * time.Second)
 			break
-		case StopPhase:
-			os.Exit(1)
+		case Relax:
+			time.Sleep(5 * time.Second)
+			break
 		default:
+			break
 		}
 	}
 
@@ -120,6 +127,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 func findMatchedFiles(path string, reduceId int) ([]string, error) {
 	var matches []string
+	pattern := fmt.Sprintf("mr-[0-9]+-%d.mp", reduceId)
 	err := filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -127,26 +135,25 @@ func findMatchedFiles(path string, reduceId int) ([]string, error) {
 		if info.IsDir() {
 			return nil
 		}
-
-		if matched, err := filepath.Match(fmt.Sprintf("mr-.*-%d", reduceId), filepath.Base(info.Name())); err != nil {
-			return err
-		} else if matched {
+		filename := filepath.Base(info.Name())
+		isMatched, _ := regexp.MatchString(pattern, filename)
+		if isMatched {
 			matches = append(matches, info.Name())
 		}
 		return nil
 	})
-	fmt.Printf("matched file %d", len(matches))
+	//fmt.Printf("matched file %d \n", len(matches))
 	if err != nil {
 		return nil, err
 	}
 	return matches, nil
 }
 
-func getTask() GetTaskReply {
+func getTask() (GetTaskReply, bool) {
 	args := GetTaskArgs{}
 	reply := GetTaskReply{}
-	call("Coordinator.GetTask", &args, &reply)
-	return reply
+	status := call("Coordinator.GetTask", &args, &reply)
+	return reply, status
 }
 
 // write KeyVals to json files, if succeeded return true,
@@ -172,7 +179,7 @@ func writeKeyVals(kvals []KeyValue, mapTaskNum, cntReduceNum int) bool {
 	for _, tempfile := range filesMap {
 		filename := filepath.Base(tempfile.Name())
 		tempIdx := strings.Index(filename, "#")
-		err := os.Rename(tempfile.Name(), filename[7:tempIdx])
+		err := os.Rename(tempfile.Name(), filename[7:tempIdx]+".mp")
 		if err != nil {
 			log.Fatalf("Can't rename file! with error %s", err.Error())
 			return false

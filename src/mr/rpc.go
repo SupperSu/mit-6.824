@@ -18,18 +18,14 @@ type TaskType int
 const (
 	MapPhase TaskType = iota
 	ReducePhase
-	StopPhase
 	Done
+	Relax
 )
 
 type GetTaskArgs struct {
 }
 
-type FinishMapTaskArgs struct {
-	TaskId int
-}
-
-type FinishReduceTaskArgs struct {
+type FinishTaskArgs struct {
 	TaskId int
 }
 
@@ -38,8 +34,7 @@ type TaskFinishedReply struct {
 
 type GetTaskReply struct {
 	FileName      string
-	MapTaskId     int
-	ReduceTaskId  int
+	TaskId        int
 	CntReduceTask int
 	TaskType      TaskType
 }
